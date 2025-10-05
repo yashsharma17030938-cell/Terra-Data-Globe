@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>3D Globe By Terra Date</title>
+  <style>
+    :root{--bg:#05060a;--panel:rgba(6,6,8,0.65);--muted:#9aa7b2}
+    html,body{height:100%;margin:0;background:var(--bg);color:#eef;font-family:Inter,system-ui,Segoe UI,Roboto}
+    #app{height:100%;display:flex;flex-direction:column}
+    #canvas-container{flex:1;position:relative;overflow:hidden}
+    canvas{display:block}
+
+    /* Panel (compact & collapsible) */
+    .panel{position:absolute;left:12px;top:12px;max-width:380px;background:var(--panel);backdrop-filter:blur(10px);padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,0.04);box-shadow:0 10px 40px rgba(0,0,0,0.7);z-index:20}
+    .panel.collapsed{width:48px;height:48px;padding:6px;overflow:hidden;border-radius:12px}
+    .panel h3{margin:0 0 6px;font-size:13px}
+    .row{display:flex;gap:8px;align-items:center}
+    label{display:block;margin:6px 0 4px;font-size:13px;color:var(--muted)}
+
+    /* Darkened / blurred selects and inputs */
+    select,input[type="date"],input[type="range"],button,input[type="text"]{width:100%;padding:6px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);background:rgba(0,0,0,0.75);backdrop-filter:blur(6px);color:#fff;font-size:13px}
+    select{appearance:none}
+    select option{background:#000;color:#fff}
+    input[type="range"]{height:28px}
+    .small{width:auto;padding:6px 8px}
+    .muted{color:var(--muted);font-size:13px}
+    .controls-grid{display:grid;grid-template-columns:1fr 76px 40px;gap:8px;align-items:center}
+    .footer{position:absolute;left:12px;right:12px;bottom:12px;padding:8px;text-align:center;font-size:12px;color:var(--muted)}
+    .status{position:absolute;right:12px;top:12px;padding:8px;background:rgba(0,0,0,0.35);border-radius:8px;font-size:13px}
+    .error{color:#ff8a8a;font-size:13px;margin-top:8px}
+    .panel .slot{border-top:1px dashed rgba(255,255,255,0.03);padding-top:8px;margin-top:8px}
+    .handle{cursor:grab;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+    .link{color:#9fd0ff;text-decoration:underline}
+    #coords{position:absolute;left:12px;bottom:80px;background:rgba(0,0,0,0.45);padding:8px;border-radius:8px;font-size:13px}
+    .collapse-btn{background:transparent;border:0;color:#9fd0ff;font-size:15px;cursor:pointer}
+    .hint{font-size:12px;color:var(--muted);margin-top:6px}
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="canvas-container"></div>
+  <div class="footer">3D Globe — NASA GIBS — Advanced GUI • Run from a local HTTP server (python -m http.server) for best results (CORS)</div>
+</div>
+
+<script type="module">
+import * as THREE from 'https://esm.sh/three@0.150.1';
+import { OrbitControls } from 'https://esm.sh/three@0.150.1/examples/jsm/controls/OrbitControls.js';
+
+// ---- Config ----
+const GIBS_WMS_ROOT = 'https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi';
+const LAYERS = {
+  'None': 'none',
+  'Blue Marble (base relief)': 'BlueMarble_ShadedRelief',
+  'MODIS Terra True Color (overlay)': 'MODIS_Terra_CorrectedReflectance_TrueColor',
+  'MODIS Terra Snow Cover': 'MODIS_Terra_Snow_Cover',
+  'VIIRS Night Lights 2012': 'VIIRS_CityLights_2012'
+};
+const DEFAULT_DATE = new Date().toISOString().slice(0,10);
+
+// ---- Helpers ----
+function buildWMS(layer, date, width=2048, height=1024, nocache=false){
+  const params = new URLSearchParams({
+    SERVICE: 'WMS', REQUEST: 'GetMap', VERSION: '1.1.1', LAYERS: layer, STYLES: '', FORMAT: 'image/png', TRANSPARENT: 'TRUE', SRS: 'EPSG:4326', BBOX: '-180,-90,180,90', WIDTH: String(width), HEIGHT: String(height)
+  });
+  if(date) params.set('TIME', date);
+  if(nocache) params.set('_t', String(Date.now()));
+  return `${GIBS_WMS_ROOT}?${params.toString()}`;
+}
+function debounce(fn, ms=250){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+
+// ---- Scene setup ----
+const container = document.getElementById('canvas-container');
+if(!container) throw new Error('Missing container');
+
+const scene = new THREE.Scene();
+const renderer = new THREE.WebGLRenderer({antialias:true, alpha:false});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
+container.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(45, (container.clientWidth||window.innerWidth)/(container.clientHeight||window.innerHeight), 0.1, 5000);
+camera.position.set(0,0,3.6);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.dampingFactor = 0.07; controls.minDistance = 0.4; controls.maxDistance = 40;
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+
+// ---- Background sphere (allows loading a real data starfield image) ----
+let bgSphere = null;
+function setBackgroundFromImageUrl(url){
+  if(!url) return removeBackgroundSphere();
+  // load image and apply to inside of a large sphere
+  fetch(url, {mode:'cors'}).then(r=>{ if(!r.ok) throw new Error('Background fetch failed'); return r.blob(); }).then(blob=>createImageBitmap(blob)).then(bitmap=>{
+    const tex = new THREE.CanvasTexture(bitmap);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.needsUpdate = true; tex.flipY=false;
+    if(bgSphere) scene.remove(bgSphere);
+    const geo = new THREE.SphereGeometry(600, 64, 32);
+    const mat = new THREE.MeshBasicMaterial({map:tex, side:THREE.BackSide});
+    bgSphere = new THREE.Mesh(geo, mat);
+    scene.add(bgSphere);
+  }).catch(err=>{
+    console.warn('Background image failed, using procedural starfield', err);
+    createProceduralStarfield();
+  });
+}
+function removeBackgroundSphere(){ if(bgSphere){ scene.remove(bgSphere); bgSphere.geometry.dispose(); if(bgSphere.material.map) bgSphere.material.map.dispose(); bgSphere=null; } }
+
+// procedural starfield (fallback)
+let starfield = null;
+function createProceduralStarfield(count=1800, radius=60){ if(bgSphere){ scene.remove(bgSphere); bgSphere=null; }
+  if(starfield){ scene.remove(starfield); starfield.geometry.dispose(); starfield.material.dispose(); starfield=null; }
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(count*3);
+  for(let i=0;i<count;i++){
+    const theta = Math.acos(2*Math.random()-1);
+    const phi = 2*Math.PI*Math.random();
+    const r = radius*(0.95+0.05*Math.random());
+    const x = r*Math.sin(theta)*Math.cos(phi);
+    const y = r*Math.sin(theta)*Math.sin(phi);
+    const z = r*Math.cos(theta);
+    pos[i*3]=x;pos[i*3+1]=y;pos[i*3+2]=z;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  const mat = new THREE.PointsMaterial({size:0.04, transparent:true, opacity:0.9});
+  starfield = new THREE.Points(geo, mat);
+  scene.add(starfield);
+}
+
+// start with procedural starfield
+createProceduralStarfield();
+
+// ---- Globe ----
+const RADIUS = 1;
+const globeGeo = new THREE.SphereGeometry(RADIUS, 128, 128);
+const baseMat = new THREE.MeshPhongMaterial({color:0x888888});
+const baseMesh = new THREE.Mesh(globeGeo, baseMat);
+scene.add(baseMesh);
+
+// overlay slots
+const overlaySlots = 3;
+const overlayMaterials = [];
+const overlayMeshes = [];
+for(let i=0;i<overlaySlots;i++){
+  const mat = new THREE.MeshBasicMaterial({transparent:true, opacity:0.85, depthWrite:false});
+  overlayMaterials.push(mat);
+  const mesh = new THREE.Mesh(globeGeo.clone(), mat);
+  mesh.scale.set(1.001 + i*0.0005, 1.001 + i*0.0005, 1.001 + i*0.0005);
+  mesh.visible = false;
+  overlayMeshes.push(mesh);
+  scene.add(mesh);
+}
+
+// grid
+const gridHelper = new THREE.LineSegments(new THREE.WireframeGeometry(new THREE.SphereGeometry(RADIUS*1.0008, 24, 24)), new THREE.LineBasicMaterial({color:0xffffff, opacity:0.03, transparent:true}));
+scene.add(gridHelper);
+
+// raycaster for hover lat/lon
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+
+// ---- Robust texture loader with fallback ----
+async function loadTextureFromWMS(layer, date, width=2048, height=1024, nocache=false){
+  if(!layer || layer==='none') throw new Error('Layer is none');
+  const url = buildWMS(layer, date, width, height, nocache);
+  const resp = await fetch(url, {mode:'cors'});
+  if(!resp.ok) throw new Error(`WMS request failed: ${resp.status}`);
+  const blob = await resp.blob();
+  try{
+    const bitmap = await createImageBitmap(blob);
+    const tex = new THREE.CanvasTexture(bitmap);
+    tex.needsUpdate = true; tex.flipY=false; tex.minFilter=THREE.LinearFilter; tex.magFilter=THREE.LinearFilter;
+    return tex;
+  }catch(err){
+    // fallback to Image element
+    try{
+      const img = new Image(); img.crossOrigin='anonymous'; const obj = URL.createObjectURL(blob);
+      await new Promise((resolve,reject)=>{ img.onload=()=>{ URL.revokeObjectURL(obj); resolve(); }; img.onerror=(e)=>{ URL.revokeObjectURL(obj); reject(e); }; img.src=obj; });
+      const tex = new THREE.Texture(img); tex.needsUpdate=true; tex.flipY=false; tex.minFilter=THREE.LinearFilter; tex.magFilter=THREE.LinearFilter; return tex;
+    }catch(e){ throw new Error('The source image could not be decoded.'); }
+  }
+}
+
+// ---- UI ----
+const ui = document.createElement('div'); ui.className='panel';
+ui.innerHTML = `
+  <div class="handle"><h3>3D Globe — Advanced GUI</h3><button id="collapse" class="collapse-btn">▤</button></div>
+  <div class="muted">Base layer</div>
+  <select id="base-select"></select>
+  <div class="muted">Resolution / zoom behavior</div>
+  <select id="res-select"><option value="1024">1024×512</option><option value="2048" selected>2048×1024</option><option value="4096">4096×2048</option><option value="8192">8192×4096 (high-res)</option></select>
+  <div class="slot">
+    <div class="muted">Overlays (up to ${overlaySlots})</div>
+    <div id="overlays"></div>
+  </div>
+  <label>Timeline / date</label>
+  <div class="controls-grid"><input id="date" type="date" value="${DEFAULT_DATE}"><button id="prev" class="small">◀</button><button id="play" class="small">▶</button></div>
+  <div class="row" style="margin-top:8px">
+    <button id="snapshot" class="small">Save PNG</button>
+    <button id="toggleStars" class="small">Toggle stars</button>
+    <button id="bgLoad" class="small">Load Background</button>
+  </div>
+  <label>Background starfield image URL (optional)</label>
+  <input id="bgUrl" type="text" placeholder="Paste a starfield image URL (NASA or other public source)">
+  <div class="hint">Tip: leave blank to use procedural starfield. You can paste a NASA star map URL here.</div>
+  <div class="muted" style="margin-top:8px">Tips: Hover globe to see lat/lon. Space toggles timeline play/pause. Forward button removed. Revolution / autorotate disabled to match user request.</div>
+  <div id="error" class="error" style="display:none"></div>
+`;
+container.appendChild(ui);
+
+const collapseBtn = ui.querySelector('#collapse');
+const baseSelect = ui.querySelector('#base-select');
+const overlaysDiv = ui.querySelector('#overlays');
+const resSelect = ui.querySelector('#res-select');
+const dateInput = ui.querySelector('#date');
+const prevBtn = ui.querySelector('#prev');
+const playBtn = ui.querySelector('#play');
+const snapshotBtn = ui.querySelector('#snapshot');
+const toggleStarsBtn = ui.querySelector('#toggleStars');
+const bgLoadBtn = ui.querySelector('#bgLoad');
+const bgUrlInput = ui.querySelector('#bgUrl');
+const errorDiv = ui.querySelector('#error');
+
+// populate layer selects
+for(const [label, name] of Object.entries(LAYERS)){
+  const opt = document.createElement('option'); opt.value = name; opt.textContent = label; baseSelect.appendChild(opt);
+}
+baseSelect.value = LAYERS['Blue Marble (base relief)'];
+
+// overlay controls
+const overlayControls = [];
+for(let i=0;i<overlaySlots;i++){
+  const wrap = document.createElement('div'); wrap.style.marginTop='6px';
+  wrap.innerHTML = `
+    <div class="row">
+      <select data-slot="${i}" class="layer-select"></select>
+      <input type="range" min="0" max="1" step="0.01" value="${0.85 - i*0.2}" data-slot="${i}" class="opacity-range" style="width:120px">
+      <button data-slot="${i}" class="small toggle">Off</button>
+    </div>
+  `;
+  overlaysDiv.appendChild(wrap);
+  const sel = wrap.querySelector('.layer-select');
+  const noneOpt = document.createElement('option'); noneOpt.value='none'; noneOpt.textContent='None'; sel.appendChild(noneOpt);
+  for(const [label,name] of Object.entries(LAYERS)){ if(name==='none') continue; const o=document.createElement('option'); o.value=name; o.textContent=label; sel.appendChild(o); }
+  sel.value = i===0 ? LAYERS['MODIS Terra True Color (overlay)'] : 'none';
+  const opacity = wrap.querySelector('.opacity-range');
+  const btn = wrap.querySelector('.toggle');
+  btn.textContent = sel.value==='none' ? 'Off' : 'On';
+  overlayControls.push({sel,opacity,btn});
+}
+
+// ---- State ----
+let baseTex = null;
+const overlayTexs = new Array(overlaySlots).fill(null);
+let playing = false; let playInterval=null; const playSpeedMs = 700;
+let autorotateDisabled = true; // explicitly disabled per user
+
+const debouncedUpdate = debounce(updateTextures, 350);
+
+// update logic: if camera is close, increase resolution (attempt to emulate 'zoom')
+function getDesiredResolution(){
+  const dist = camera.position.length();
+  // when camera is very close, try the highest resolution option
+  if(dist < 1.0) return Number(resSelect.querySelector('option[value="8192"]').value || 8192);
+  if(dist < 1.8) return Number(resSelect.value) * 2; // try to boost
+  return Number(resSelect.value);
+}
+
+async function updateTextures(opts={nocache:false}){
+  const res = getDesiredResolution();
+  const w = Math.min(8192, res); const h = Math.round(w/2);
+  const date = dateInput.value;
+  errorDiv.style.display='none'; errorDiv.textContent='';
+  try{
+    const layer = baseSelect.value;
+    baseMat.map = null; baseMat.needsUpdate = true;
+    if(layer && layer!=='none'){
+      baseTex = await loadTextureFromWMS(layer, date, w, h, opts.nocache);
+      baseTex.wrapS = THREE.RepeatWrapping; baseTex.wrapT = THREE.RepeatWrapping;
+      baseMat.map = baseTex; baseMat.needsUpdate = true;
+    }
+  }catch(e){ console.warn('Failed base', e); errorDiv.style.display='block'; errorDiv.textContent = 'Base layer failed: '+(e.message||e); }
+
+  for(let i=0;i<overlaySlots;i++){
+    const ctl = overlayControls[i];
+    const layer = ctl.sel.value;
+    const visible = ctl.btn.textContent === 'On';
+    overlayMeshes[i].visible = visible && layer!=='none';
+    if(!visible || layer==='none') continue;
+    try{
+      overlayTexs[i] = await loadTextureFromWMS(layer, date, w, h, opts.nocache);
+      overlayTexs[i].wrapS = THREE.RepeatWrapping; overlayTexs[i].wrapT = THREE.RepeatWrapping;
+      overlayMaterials[i].map = overlayTexs[i]; overlayMaterials[i].opacity = Number(ctl.opacity.value); overlayMaterials[i].needsUpdate = true;
+    }catch(e){
+      console.warn('Failed overlay', e);
+      const msg = String(e && e.message || e);
+      if(msg.toLowerCase().includes('could not be decoded') || msg.toLowerCase().includes('source image could not be decoded')){
+        if(!errorDiv.textContent){ errorDiv.style.display='block'; errorDiv.textContent = 'Overlay load failed: The source image could not be decoded.'; }
+      } else {
+        if(!errorDiv.textContent){ errorDiv.style.display='block'; errorDiv.textContent = 'Overlay load failed: '+msg; }
+      }
+    }
+  }
+}
+
+// events
+resSelect.addEventListener('change', ()=>debouncedUpdate());
+baseSelect.addEventListener('change', ()=>debouncedUpdate());
+for(let i=0;i<overlaySlots;i++){
+  const {sel,opacity,btn} = overlayControls[i];
+  sel.addEventListener('change', ()=>{ btn.textContent = sel.value==='none' ? 'Off' : 'On'; debouncedUpdate(); });
+  opacity.addEventListener('input', ()=>{ overlayMaterials[i].opacity = Number(opacity.value); overlayMaterials[i].needsUpdate = true; });
+  btn.addEventListener('click', ()=>{ btn.textContent = btn.textContent==='On' ? 'Off' : 'On'; overlayMeshes[i].visible = (btn.textContent==='On' && sel.value!=='none'); debouncedUpdate(); });
+}
+
+// timeline controls (removed forward/next button per user request)
+prevBtn.onclick = ()=>{ const d=new Date(dateInput.value); d.setDate(d.getDate()-1); dateInput.value = d.toISOString().slice(0,10); debouncedUpdate(); };
+playBtn.onclick = ()=>{ playing=!playing; playBtn.textContent = playing? '⏸':'▶'; if(playing){ playInterval = setInterval(()=>{ const d=new Date(dateInput.value); d.setDate(d.getDate()+1); dateInput.value = d.toISOString().slice(0,10); debouncedUpdate(); }, playSpeedMs); } else { clearInterval(playInterval); playInterval=null; } };
+
+snapshotBtn.addEventListener('click', ()=>{ renderer.render(scene,camera); const data = renderer.domElement.toDataURL('image/png'); const a = document.createElement('a'); a.href = data; a.download = `globe-${Date.now()}.png`; document.body.appendChild(a); a.click(); a.remove(); });
+
+toggleStarsBtn.addEventListener('click', ()=>{ if(starfield){ starfield.visible = !starfield.visible; } if(bgSphere){ bgSphere.visible = !bgSphere.visible; } });
+
+bgLoadBtn.addEventListener('click', ()=>{ const url = bgUrlInput.value.trim(); if(!url){ removeBackgroundSphere(); createProceduralStarfield(); } else { // try set background
+  // remove procedural starfield if present
+  if(starfield){ scene.remove(starfield); starfield.geometry.dispose(); starfield.material.dispose(); starfield=null; }
+  setBackgroundFromImageUrl(url);
+}});
+
+// hover lat/lon
+const coordsDiv = document.createElement('div'); coordsDiv.id='coords'; coordsDiv.textContent = 'Lat: —  Lon: —'; container.appendChild(coordsDiv);
+container.addEventListener('pointermove', (ev)=>{
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((ev.clientX - rect.left)/rect.width)*2 -1;
+  pointer.y = -((ev.clientY - rect.top)/rect.height)*2 +1;
+  raycaster.setFromCamera(pointer, camera);
+  const intersects = raycaster.intersectObject(baseMesh, true);
+  if(intersects.length){
+    const p = intersects[0].point.clone().normalize();
+    const lat = Math.asin(p.y)*180/Math.PI;
+    const lon = Math.atan2(p.z, p.x)*180/Math.PI;
+    coordsDiv.textContent = `Lat: ${lat.toFixed(4)}  Lon: ${lon.toFixed(4)}`;
+  }
+});
+
+// keyboard: space toggles timeline play/pause only (autorotate removed)
+window.addEventListener('keydown',(ev)=>{ if(ev.key===' ') { ev.preventDefault(); playBtn.click(); } });
+
+// collapse panel
+collapseBtn.addEventListener('click', ()=>{ ui.classList.toggle('collapsed'); });
+
+// draggable panel
+(function makeDraggable(el){ let isDown=false, startX=0, startY=0, startL=0, startT=0; const hdr = el.querySelector('.handle'); hdr.style.userSelect='none'; hdr.addEventListener('pointerdown',(e)=>{ isDown=true; startX=e.clientX; startY=e.clientY; const rect=el.getBoundingClientRect(); startL=rect.left; startT=rect.top; hdr.setPointerCapture(e.pointerId); }); window.addEventListener('pointermove',(e)=>{ if(!isDown) return; const dx=e.clientX-startX, dy=e.clientY-startY; el.style.left = (startL+dx)+'px'; el.style.top = (startT+dy)+'px'; }); window.addEventListener('pointerup',(e)=>{ if(!isDown) return; isDown=false; }); })(ui);
+
+// initial textures
+updateTextures();
+
+// animation/render loop
+let last = performance.now();
+function animate(t){ requestAnimationFrame(animate); const dt = t-last; last=t; controls.update(); renderer.render(scene,camera); }
+requestAnimationFrame(animate);
+
+// responsive
+function onResize(){ const w=container.clientWidth||window.innerWidth; const h=container.clientHeight||window.innerHeight; camera.aspect = w/h; camera.updateProjectionMatrix(); renderer.setSize(w,h); }
+window.addEventListener('resize', onResize);
+
+</script>
+
+</body>
+</html>
