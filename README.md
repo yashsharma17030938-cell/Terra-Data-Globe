@@ -33,7 +33,7 @@ Makes global datasets easier to understand spatially and temporally
     python -m http.server
 
 
-3. Open .html in your browser
+3. Open Globe.html in your browser
 
 Use the interface to:
 
